@@ -1,0 +1,14 @@
+# Config file with credentials
+config.json
+
+# Downloaded media
+downloads/
+
+# Log of failed downloads
+failed_downloads.log
+
+# Selenium / Chrome temporary files
+*.log
+*.pyc
+__pycache__/
+chromedriver.log
