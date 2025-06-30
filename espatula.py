@@ -2,7 +2,6 @@ import os
 import json
 import time
 import hashlib
-import threading
 import queue
 import requests
 from urllib.parse import urlparse, unquote
@@ -16,7 +15,6 @@ CONFIG_PATH = "config.json"
 FAILED_LOG_PATH = "failed_downloads.log"
 url_queue = queue.Queue()
 downloaded_urls = set()
-queue_lock = threading.Lock()
 
 def load_config():
     with open(CONFIG_PATH, "r") as f:
@@ -39,10 +37,7 @@ def md5(text):
 def login(driver, config):
     print("[→] Logging in...")
     driver.get(config["login_url"])
-
-    WebDriverWait(driver, 10).until(
-        EC.presence_of_element_located((By.ID, "navbar_loginform"))
-    )
+    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.ID, "navbar_loginform")))
 
     driver.find_element(By.ID, "navbar_username").clear()
     driver.find_element(By.ID, "navbar_username").send_keys(config["username"])
@@ -61,6 +56,9 @@ def login(driver, config):
     else:
         raise RuntimeError("[❌] Login failed.")
 
+def check_login(driver, config):
+    return config["username"] in driver.page_source or "logout.php" in driver.page_source
+
 def sanitize_filename(url):
     path = urlparse(url).path
     return os.path.basename(unquote(path)).split("?")[0]
@@ -71,30 +69,21 @@ def get_folder_name_from_url(url):
     path = parsed.path.strip("/").replace("/", "_")
     return f"{netloc}-{path}" if path else netloc
 
-def downloader_thread(download_dir):
-    while True:
-        try:
-            url = url_queue.get(timeout=10)
-        except queue.Empty:
-            return
-
+def download_sequentially(download_dir):
+    while not url_queue.empty():
+        url = url_queue.get()
         filename = sanitize_filename(url)
         out_path = os.path.join(download_dir, filename)
 
-        with queue_lock:
-            if url in downloaded_urls:
-                url_queue.task_done()
-                continue
-            downloaded_urls.add(url)
-
-        if os.path.exists(out_path):
-            print(f"[≡] Already exists: {filename}")
-            url_queue.task_done()
+        if url in downloaded_urls or os.path.exists(out_path):
+            print(f"[≡] Skipped: {filename}")
             continue
+
+        downloaded_urls.add(url)
 
         try:
             print(f"[↓] Downloading: {url}")
-            r = requests.get(url, stream=True, timeout=15)
+            r = requests.get(url, stream=True, timeout=30)
             if r.status_code == 200:
                 with open(out_path, 'wb') as f:
                     for chunk in r.iter_content(8192):
@@ -102,14 +91,11 @@ def downloader_thread(download_dir):
             else:
                 raise Exception(f"HTTP {r.status_code}")
         except Exception as e:
-            print(f"[!] Error downloading {url}: {e}")
-            with queue_lock:
-                with open(FAILED_LOG_PATH, "a", encoding="utf-8") as log:
-                    log.write(f"{url}  # {e}\n")
-        finally:
-            url_queue.task_done()
+            print(f"[!] Failed: {url}  Reason: {e}")
+            with open(FAILED_LOG_PATH, "a", encoding="utf-8") as log:
+                log.write(f"{url}  # {e}\n")
 
-def scraping_thread(driver, config, download_dir):
+def scraping_loop(driver, config, download_dir):
     current_page = config["last_page"]
     selector = config.get("content_selector", "blockquote.postcontent.restore")
 
@@ -117,6 +103,11 @@ def scraping_thread(driver, config, download_dir):
         page_url = config["page_url_pattern"].format(n=current_page)
         print(f"[→] Scraping page: {page_url}")
         driver.get(page_url)
+
+        if not check_login(driver, config):
+            print("[!] Session expired. Re-logging in...")
+            login(driver, config)
+            driver.get(page_url)
 
         try:
             WebDriverWait(driver, 10).until(
@@ -145,6 +136,8 @@ def scraping_thread(driver, config, download_dir):
         current_page += 1
         config["last_page"] = current_page
         save_config(config)
+
+        download_sequentially(download_dir)
         time.sleep(2)
 
 def main():
@@ -157,21 +150,8 @@ def main():
 
     try:
         login(driver, config)
-
-        # Start download worker threads
-        threads = []
-        for _ in range(config["max_download_threads"]):
-            t = threading.Thread(target=downloader_thread, args=(download_dir,), daemon=True)
-            t.start()
-            threads.append(t)
-
-        # Scrape and queue media URLs
-        scraping_thread(driver, config, download_dir)
-
-        # Wait until all URLs are downloaded
-        url_queue.join()
-        print("[✓] All downloads complete.")
-
+        scraping_loop(driver, config, download_dir)
+        print("[✓] Finished scraping and downloading.")
     finally:
         driver.quit()
 
